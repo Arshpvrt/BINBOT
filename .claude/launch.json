@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "C:\\Program Files\\nodejs\\node.exe",
+      "runtimeArgs": ["dashboard/node_modules/next/dist/bin/next", "dev", "dashboard"],
+      "port": 3000
+    }
+  ]
+}
