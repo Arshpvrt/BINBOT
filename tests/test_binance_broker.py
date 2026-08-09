@@ -6,6 +6,8 @@ coverage independent of any network access.
 """
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from execution.binance_broker import BinanceFuturesBroker, SymbolFilters, round_step
@@ -73,3 +75,55 @@ class TestLotConversion:
 
     def test_zero_lots_is_zero_quantity(self, broker: BinanceFuturesBroker):
         assert broker.lots_to_quantity("BTCUSDT", 0) == 0.0
+
+
+class TestLeverageCapping:
+    """Some symbols cap out below the requested leverage (Binance error
+    -4028). The broker should fall back to that symbol's actual max rather
+    than refusing to trade it, and never repeat the failed call or the
+    bracket lookup for the same symbol again."""
+
+    def _mock_client(self, broker: BinanceFuturesBroker) -> AsyncMock:
+        client = AsyncMock()
+        broker._client = client
+        return client
+
+    async def test_falls_back_to_symbol_max_leverage(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+        client.futures_change_leverage.side_effect = [Exception("APIError(code=-4028): Leverage 15 is not valid"), None]
+        client.futures_leverage_bracket.return_value = [{"brackets": [{"initialLeverage": 10}]}]
+
+        await broker._configure_leverage_and_margin("BICOUSDT", leverage=15, margin_type="CROSSED")
+
+        assert broker._configured_leverage_margin["BICOUSDT"] == (10, "CROSSED")
+        assert client.futures_change_leverage.call_count == 2
+        client.futures_change_leverage.assert_any_call(symbol="BICOUSDT", leverage=10)
+
+    async def test_reraises_when_bracket_lookup_also_fails(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+        original_error = Exception("APIError(code=-4028): Leverage 15 is not valid")
+        client.futures_change_leverage.side_effect = original_error
+        client.futures_leverage_bracket.side_effect = Exception("network error")
+
+        with pytest.raises(Exception, match="Leverage 15 is not valid"):
+            await broker._configure_leverage_and_margin("BICOUSDT", leverage=15, margin_type="CROSSED")
+        assert "BICOUSDT" not in broker._configured_leverage_margin
+
+    async def test_second_call_does_not_repeat_api_calls(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+        client.futures_change_leverage.side_effect = [Exception("APIError(code=-4028): Leverage 15 is not valid"), None]
+        client.futures_leverage_bracket.return_value = [{"brackets": [{"initialLeverage": 10}]}]
+
+        await broker._configure_leverage_and_margin("BICOUSDT", leverage=15, margin_type="CROSSED")
+        await broker._configure_leverage_and_margin("BICOUSDT", leverage=15, margin_type="CROSSED")
+
+        assert client.futures_change_leverage.call_count == 2  # not 3 or 4
+        assert client.futures_leverage_bracket.call_count == 1
+
+    async def test_no_fallback_needed_when_leverage_is_valid(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+
+        await broker._configure_leverage_and_margin("BTCUSDT", leverage=2, margin_type="ISOLATED")
+
+        assert broker._configured_leverage_margin["BTCUSDT"] == (2, "ISOLATED")
+        client.futures_leverage_bracket.assert_not_called()

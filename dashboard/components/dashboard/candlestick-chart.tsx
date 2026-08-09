@@ -25,10 +25,9 @@ const CHART_COLORS = {
 
 /**
  * Store-agnostic candlestick chart: takes candles/markers as plain props
- * rather than reading a specific Zustand store, so it can be reused both
- * for the single primary chart (PriceChart) and for the scanner's
- * multi-position grid, where several instances render simultaneously for
- * different symbols.
+ * rather than reading a specific Zustand store, so several instances can
+ * render simultaneously for different symbols in the scanner's
+ * multi-position grid.
  */
 export function CandlestickChart({
   candles,

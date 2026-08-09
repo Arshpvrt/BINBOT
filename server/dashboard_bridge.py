@@ -10,8 +10,8 @@ events — they're a running snapshot of account state.
 
 **Control (dashboard -> bot):** the browser can send back exactly five
 commands — pause, resume, flatten, kill_switch, reset_kill_switch — each
-requiring a shared-secret token (see `run_live_binance.py` for how it's
-generated/loaded) so a stray device on the network can't issue commands to
+requiring a shared-secret token (see `run_live_binance_scanner.py` for how
+it's generated/loaded) so a stray device on the network can't issue commands to
 a live account. This bridge does not implement the actions itself; it
 dispatches to callables injected by the caller, keeping this module
 broker/strategy-agnostic. Defaults to binding `127.0.0.1` only (not

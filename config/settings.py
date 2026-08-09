@@ -29,29 +29,10 @@ class BinanceSettings(BaseSettings):
     # never change it without deliberately meaning to.
     testnet: bool = True
 
-    symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
-    leverage: int = 2
-    margin_type: str = "ISOLATED"  # ISOLATED (recommended) or CROSSED
     recv_window_ms: int = 5000
     reconnect_backoff_s: float = 2.0
     reconnect_backoff_max_s: float = 60.0
     user_stream_keepalive_s: float = 1800.0  # Binance listenKey expires after 60 min idle
-
-    @field_validator("margin_type")
-    @classmethod
-    def _validate_margin_type(cls, v: str) -> str:
-        allowed = {"ISOLATED", "CROSSED"}
-        v = v.upper()
-        if v not in allowed:
-            raise ValueError(f"margin_type must be one of {allowed}")
-        return v
-
-    @field_validator("leverage")
-    @classmethod
-    def _validate_leverage(cls, v: int) -> int:
-        if not (1 <= v <= 125):
-            raise ValueError("leverage must be in [1, 125]")
-        return v
 
 
 class IBKRSettings(BaseSettings):
@@ -106,21 +87,6 @@ class DataSettings(BaseSettings):
     tick_channel_prefix: str = "ticks"
     bar_channel_prefix: str = "bars"
     execution_channel: str = "executions"
-
-
-class StrategySettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="STRATEGY_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
-
-    pairs_symbol_a: str = "ES"
-    pairs_symbol_b: str = "NQ"
-    pairs_lookback_bars: int = 250
-    zscore_entry: float = 2.0
-    zscore_exit: float = 0.5
-    zscore_stop: float = 4.0
-    kalman_delta: float = 1e-4
-    kalman_obs_covariance: float = 1e-3
 
 
 class ScannerStrategySettings(BaseSettings):
@@ -184,7 +150,6 @@ class Settings(BaseSettings):
     binance: BinanceSettings = Field(default_factory=BinanceSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     data: DataSettings = Field(default_factory=DataSettings)
-    strategy: StrategySettings = Field(default_factory=StrategySettings)
     scanner: ScannerStrategySettings = Field(default_factory=ScannerStrategySettings)
 
     @field_validator("env")

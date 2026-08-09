@@ -160,7 +160,7 @@ class BinanceFuturesBroker(BrokerInterface):
     @property
     def client(self) -> "AsyncClient":
         """Expose the underlying `binance.AsyncClient` for adapters that need
-        it directly (e.g. `BinanceFuturesMarketDataFeed`), once connected."""
+        it directly (e.g. `BinanceUniverseFeed`), once connected."""
         if self._client is None:
             raise RuntimeError("BinanceFuturesBroker.connect() has not been called yet")
         return self._client
@@ -253,20 +253,47 @@ class BinanceFuturesBroker(BrokerInterface):
 
     async def _configure_leverage_and_margin(self, symbol: str, *, leverage: int, margin_type: str) -> None:
         assert self._client is not None
-        if self._configured_leverage_margin.get(symbol) == (leverage, margin_type):
-            return  # already set to exactly this — avoid a redundant API call
+        if symbol in self._configured_leverage_margin:
+            return  # already resolved for this symbol — avoid redundant API calls
         try:
             await self._client.futures_change_margin_type(symbol=symbol, marginType=margin_type)
         except Exception as exc:
             # Binance raises an error if the margin type is already set to
             # this value — that is not a real failure, just log it quietly.
             logger.debug("binance.margin_type_unchanged", symbol=symbol, detail=str(exc))
+
+        effective_leverage = leverage
         try:
             await self._client.futures_change_leverage(symbol=symbol, leverage=leverage)
         except Exception as exc:
-            logger.error("binance.set_leverage_failed", symbol=symbol, error=str(exc))
-            raise
-        self._configured_leverage_margin[symbol] = (leverage, margin_type)
+            # Some symbols cap out below the requested leverage (Binance
+            # error -4028) — fall back to that symbol's actual max instead
+            # of refusing to trade it at all. Resolved once and cached
+            # below, so this symbol never repeats the lookup or the error.
+            max_leverage = await self._max_leverage_for(symbol)
+            if max_leverage is not None and max_leverage < leverage:
+                await self._client.futures_change_leverage(symbol=symbol, leverage=max_leverage)
+                effective_leverage = max_leverage
+                logger.warning(
+                    "binance.leverage_capped", symbol=symbol, requested=leverage, using=max_leverage
+                )
+            else:
+                logger.error("binance.set_leverage_failed", symbol=symbol, error=str(exc))
+                raise
+        self._configured_leverage_margin[symbol] = (effective_leverage, margin_type)
+
+    async def _max_leverage_for(self, symbol: str) -> int | None:
+        """The highest leverage Binance allows for this symbol at its
+        lowest notional tier (bracket 1). None if the lookup itself fails
+        — the caller then surfaces the original error instead of masking
+        it with a second, unrelated one."""
+        assert self._client is not None
+        try:
+            brackets = await self._client.futures_leverage_bracket(symbol=symbol)
+            return int(brackets[0]["brackets"][0]["initialLeverage"])
+        except Exception as exc:
+            logger.debug("binance.leverage_bracket_lookup_failed", symbol=symbol, error=str(exc))
+            return None
 
     async def get_usdt_perpetual_universe(self, *, force_refresh: bool = False) -> list[str]:
         """Every currently-tradeable USDT-margined perpetual future — the

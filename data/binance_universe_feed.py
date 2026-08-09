@@ -1,8 +1,8 @@
 """Exchange-wide market data feed for the funding-momentum scanner.
 
-Unlike `BinanceFuturesMarketDataFeed` (which subscribes per-symbol for a
-small, fixed watchlist), this feed subscribes ONCE to Binance's combined
-all-market mark-price stream — a single websocket connection that pushes
+Rather than subscribing per-symbol for a small, fixed watchlist, this feed
+subscribes ONCE to Binance's combined all-market mark-price stream — a
+single websocket connection that pushes
 mark price + funding rate for every USDT-M futures symbol in one message,
 about once a second. That is what makes scanning ~300 symbols practical:
 one connection instead of hundreds.

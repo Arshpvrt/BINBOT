@@ -204,6 +204,3 @@ export function createTradingStore(): UseBoundStore<StoreApi<TradingState>> {
     },
   }));
 }
-
-/** The pairs-trading bot's store (single primary chart symbol). */
-export const useTradingStore = createTradingStore();
