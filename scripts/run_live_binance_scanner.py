@@ -231,6 +231,14 @@ async def main() -> None:
         # Different port from the pairs-trading script (8765) so both bots
         # can run — and both be watched on the dashboard — at once.
         port=8766,
+        # DashboardBridge defaults to 127.0.0.1 (loopback-only) since it has
+        # a write path. Widened to all interfaces here specifically because
+        # this deployment's actual access control is Tailscale (a private,
+        # authenticated overlay network) plus the AWS security group, which
+        # only allows inbound SSH — nothing routes to this port from the
+        # public internet either way, and every command still requires the
+        # control_token on top of that.
+        host="0.0.0.0",
     )
     await dashboard_bridge.start()
     logger.info(
