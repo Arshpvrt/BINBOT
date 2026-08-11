@@ -378,13 +378,25 @@ async def main() -> None:
     async def monitor_loop() -> None:
         while not shutdown_event.is_set():
             await asyncio.sleep(5.0)
-            equity = await broker.get_account_equity()
-            for symbol, qty in (await broker.get_positions()).items():
-                risk_engine.update_position(symbol, qty)
-            if circuit_breaker.update(equity):
-                logger.critical("circuit_breaker.tripped_cancelling_all_orders")
-                await order_manager.cancel_all()
-            recovery.persist()
+            try:
+                equity = await broker.get_account_equity()
+                for symbol, qty in (await broker.get_positions()).items():
+                    risk_engine.update_position(symbol, qty)
+                if circuit_breaker.update(equity):
+                    logger.critical("circuit_breaker.tripped_cancelling_all_orders")
+                    await order_manager.cancel_all()
+                recovery.persist()
+            except Exception:
+                # A single failed Binance call here (rate limit, network
+                # blip, timeout) used to kill this task, which tore down
+                # the whole process via the asyncio.wait() below — and
+                # systemd's Restart=always then immediately retried the
+                # same still-failing call, crash-looping (175+ restarts
+                # observed during one Binance rate-limit ban) and likely
+                # extending the ban further with every retry. Log and
+                # back off instead; next iteration tries again in 5s+.
+                logger.exception("monitor_loop.check_failed")
+                await asyncio.sleep(10.0)
 
     try:
         await asyncio.wait(
