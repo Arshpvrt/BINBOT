@@ -23,7 +23,11 @@ if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
     exit 0
 fi
 
-STATE_FILE="${BINBOT_WATCHDOG_STATE_FILE:-$HOME/BINBOT/data_store/watchdog_state.txt}"
+# Relative to the systemd unit's WorkingDirectory (the project root) — not
+# $HOME, which systemd does not set for a service unless it runs under a
+# full login environment (User=/PAMName=), so referencing it under `set -u`
+# fails with "HOME: unbound variable" the moment this runs as a service.
+STATE_FILE="${BINBOT_WATCHDOG_STATE_FILE:-data_store/watchdog_state.txt}"
 SERVICES=(binbot-scanner binbot-dashboard)
 
 send_alert() {
