@@ -291,6 +291,7 @@ async def main() -> None:
         trailing_profit_base_roi_pct=sset.trailing_profit_base_roi_pct,
         trailing_profit_step_roi_pct=sset.trailing_profit_step_roi_pct,
         trailing_profit_step_increment_roi_pct=sset.trailing_profit_step_increment_roi_pct,
+        trailing_profit_hard_cap_roi_pct=sset.trailing_profit_hard_cap_roi_pct,
         poll_interval_s=sset.position_monitor_interval_s,
         on_close_event=on_position_close,
         price_lookup=universe_feed.latest_price,

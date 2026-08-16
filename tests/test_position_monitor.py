@@ -46,6 +46,7 @@ def monitor(broker: AsyncMock, order_manager: AsyncMock) -> PositionMonitor:
         trailing_profit_base_roi_pct=20.0,
         trailing_profit_step_roi_pct=2.0,
         trailing_profit_step_increment_roi_pct=5.0,
+        trailing_profit_hard_cap_roi_pct=80.0,
     )
 
 
@@ -278,3 +279,73 @@ class TestTrailingProfitExitLogic:
         await monitor._check_once()
 
         assert "BTCUSDT" not in monitor._peak_roi_pct
+
+
+class TestProfitHardCap:
+    """margin_usdt=50.0 in the fixture, so 80% ROI is unrealized=40.0."""
+
+    async def test_hard_cap_closes_immediately_without_waiting_for_a_pullback(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=40.0)  # exactly 80% ROI
+        ]
+
+        await monitor._check_once()  # closes on THIS poll — unlike trailing-profit, no second poll needed
+
+        order_manager.submit.assert_awaited_once()
+        signal = order_manager.submit.call_args.args[0]
+        assert signal.side is OrderSide.SELL
+        assert signal.target_quantity == 15
+
+    async def test_hard_cap_closes_a_short_position(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        broker.get_position_details.return_value = [
+            detail("ETHUSDT", side=OrderSide.SELL, qty=100, entry=1900.0, unrealized=40.0)
+        ]
+
+        await monitor._check_once()
+
+        signal = order_manager.submit.call_args.args[0]
+        assert signal.side is OrderSide.BUY
+        assert signal.target_quantity == 100
+
+    async def test_just_below_the_cap_does_not_trigger_it(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=39.5)  # 79% ROI
+        ]
+
+        await monitor._check_once()
+
+        order_manager.submit.assert_not_awaited()
+
+    async def test_hard_cap_reason_string_is_distinct_from_trailing_profit(
+        self, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        # dashboard_bridge.py keys its Telegram/audit labeling off this
+        # exact reason-string prefix (PROFIT-CAP vs TRAILING-PROFIT), so a
+        # regression here would silently mislabel every cap-triggered exit.
+        seen_reasons: list[str] = []
+        monitor = PositionMonitor(
+            broker,
+            order_manager,
+            stop_loss_usdt=200.0,
+            margin_usdt=50.0,
+            trailing_profit_arm_roi_pct=30.0,
+            trailing_profit_base_roi_pct=20.0,
+            trailing_profit_step_roi_pct=2.0,
+            trailing_profit_step_increment_roi_pct=5.0,
+            trailing_profit_hard_cap_roi_pct=80.0,
+            on_close_event=lambda symbol, reason: seen_reasons.append(reason),
+        )
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=40.0)
+        ]
+
+        await monitor._check_once()
+
+        assert len(seen_reasons) == 1
+        assert seen_reasons[0].startswith("PROFIT-CAP")

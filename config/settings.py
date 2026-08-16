@@ -123,6 +123,11 @@ class ScannerStrategySettings(BaseSettings):
     trailing_profit_base_roi_pct: float = 20.0
     trailing_profit_step_roi_pct: float = 2.0
     trailing_profit_step_increment_roi_pct: float = 5.0
+    # Unconditional ceiling: closes the instant ROI reaches this, even
+    # without waiting for a pullback — a hard cap on top of the trailing
+    # stop above, so an exceptional move doesn't ride all the way back
+    # down to a (by then, much higher) trailing level before exiting.
+    trailing_profit_hard_cap_roi_pct: float = 80.0
 
     price_jump_pct: float = 10.0
     price_jump_window_min: int = 20
@@ -156,6 +161,12 @@ class ScannerStrategySettings(BaseSettings):
     def _validate_trailing_base_below_arm(self) -> "ScannerStrategySettings":
         if self.trailing_profit_base_roi_pct > self.trailing_profit_arm_roi_pct:
             raise ValueError("trailing_profit_base_roi_pct must not exceed trailing_profit_arm_roi_pct")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_hard_cap_above_arm(self) -> "ScannerStrategySettings":
+        if self.trailing_profit_hard_cap_roi_pct <= self.trailing_profit_arm_roi_pct:
+            raise ValueError("trailing_profit_hard_cap_roi_pct must exceed trailing_profit_arm_roi_pct")
         return self
 
     @property

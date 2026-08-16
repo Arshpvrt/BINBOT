@@ -55,6 +55,7 @@ class PositionMonitor:
         trailing_profit_base_roi_pct: float,
         trailing_profit_step_roi_pct: float,
         trailing_profit_step_increment_roi_pct: float,
+        trailing_profit_hard_cap_roi_pct: float,
         poll_interval_s: float = 2.0,
         on_close_event: Callable[[str, str], "asyncio.Future[None] | None"] | None = None,
         price_lookup: Callable[[str], float | None] | None = None,
@@ -67,6 +68,7 @@ class PositionMonitor:
         self._trailing_base_pct = trailing_profit_base_roi_pct
         self._trailing_step_pct = trailing_profit_step_roi_pct
         self._trailing_step_increment_pct = trailing_profit_step_increment_roi_pct
+        self._hard_cap_pct = trailing_profit_hard_cap_roi_pct
         self._poll_interval_s = poll_interval_s
         self._on_close_event = on_close_event
         self._price_lookup = price_lookup
@@ -94,6 +96,7 @@ class PositionMonitor:
             trailing_profit_base_pct=self._trailing_base_pct,
             trailing_profit_step_pct=self._trailing_step_pct,
             trailing_profit_step_increment_pct=self._trailing_step_increment_pct,
+            trailing_profit_hard_cap_pct=self._hard_cap_pct,
             poll_interval_s=self._poll_interval_s,
         )
 
@@ -137,6 +140,16 @@ class PositionMonitor:
                     detail.symbol,
                     self._positions[detail.symbol],
                     reason=f"STOP-LOSS: {detail.unrealized_pnl:.2f} USDT <= -{self._stop_loss_usdt:.0f} USDT",
+                )
+            elif roi_pct >= self._hard_cap_pct:
+                # Unconditional — closes immediately without waiting for a
+                # pullback, so an exceptional move doesn't have to ride all
+                # the way back down to a (by then, much higher) trailing
+                # level before exiting.
+                await self._close_position(
+                    detail.symbol,
+                    self._positions[detail.symbol],
+                    reason=f"PROFIT-CAP: {roi_pct:.2f}% ROI >= cap {self._hard_cap_pct:.0f}%",
                 )
             elif peak_roi_pct >= self._trailing_arm_pct:
                 trail_level_pct = self._trailing_stop_level(peak_roi_pct)
