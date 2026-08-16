@@ -3,13 +3,25 @@ directly from Binance, not recomputed locally — see
 `BinanceFuturesBroker.get_position_details`) and closes a position the
 instant it hits the stop-loss threshold or a trailing profit stop.
 
+The stop-loss is a percentage of the LIVE futures account balance
+(`stop_loss_equity_pct`), but only a snapshot of it: the first time a
+position is seen, current equity is read once and `equity *
+stop_loss_equity_pct / 100` is frozen for that position's entire
+lifetime — it does not recalculate while the position is held, same
+lifecycle a flat dollar amount would have had. Each position's margin
+(used below for ROI%) isn't a config value either — it's computed
+directly from what Binance reports for that specific position
+(quantity × step size × entry price ÷ leverage), since different
+positions can have been sized off different equity at entry.
+
 The profit exit is a trailing stop, not a fixed target: once a position's
-unrealized ROI (against margin_usdt) first reaches `trailing_arm_pct`, a
-stop arms at `trailing_base_pct` and rises `trailing_step_pct` for every
-additional `trailing_step_increment_pct` of PEAK profit reached after
-that — see `_trailing_stop_level()`. The position closes once ROI pulls
-back down to whatever that trailing level currently is, so a strong move
-keeps running instead of every winner getting capped at the same target.
+unrealized ROI (against ITS OWN margin, computed as above) first reaches
+`trailing_arm_pct`, a stop arms at `trailing_base_pct` and rises
+`trailing_step_pct` for every additional `trailing_step_increment_pct` of
+PEAK profit reached after that — see `_trailing_stop_level()`. The
+position closes once ROI pulls back down to whatever that trailing level
+currently is, so a strong move keeps running instead of every winner
+getting capped at the same target.
 
 Also arms a native, exchange-side stop-loss order the moment a position is
 first seen, and disarms it once the position is closed by any other means
@@ -49,8 +61,9 @@ class PositionMonitor:
         broker: BinanceFuturesBroker,
         order_manager: OrderLifecycleManager,
         *,
-        stop_loss_usdt: float,
-        margin_usdt: float,
+        stop_loss_equity_pct: float,
+        leverage: float,
+        step_size_lookup: Callable[[str], float],
         trailing_profit_arm_roi_pct: float,
         trailing_profit_base_roi_pct: float,
         trailing_profit_step_roi_pct: float,
@@ -62,8 +75,9 @@ class PositionMonitor:
     ) -> None:
         self._broker = broker
         self._order_manager = order_manager
-        self._stop_loss_usdt = stop_loss_usdt
-        self._margin_usdt = margin_usdt
+        self._stop_loss_equity_pct = stop_loss_equity_pct
+        self._leverage = leverage
+        self._step_size_lookup = step_size_lookup
         self._trailing_arm_pct = trailing_profit_arm_roi_pct
         self._trailing_base_pct = trailing_profit_base_roi_pct
         self._trailing_step_pct = trailing_profit_step_roi_pct
@@ -77,6 +91,10 @@ class PositionMonitor:
         self._closing: set[str] = set()
         self._native_stop_order_id: dict[str, str] = {}
         self._peak_roi_pct: dict[str, float] = {}
+        # Frozen at the moment each position is first seen (a % of equity
+        # AT THAT MOMENT) — deliberately never recomputed afterward, see
+        # module docstring.
+        self._position_stop_loss_usdt: dict[str, float] = {}
         self._task: asyncio.Task[None] | None = None
         self._running = False
 
@@ -91,7 +109,8 @@ class PositionMonitor:
         self._task = asyncio.create_task(self._loop(), name="position-monitor")
         logger.info(
             "position_monitor.started",
-            stop_loss_usdt=self._stop_loss_usdt,
+            stop_loss_equity_pct=self._stop_loss_equity_pct,
+            leverage=self._leverage,
             trailing_profit_arm_pct=self._trailing_arm_pct,
             trailing_profit_base_pct=self._trailing_base_pct,
             trailing_profit_step_pct=self._trailing_step_pct,
@@ -128,18 +147,26 @@ class PositionMonitor:
                 # Newly seen — either a fresh entry, or a position that was
                 # already open when this process (re)started. Either way,
                 # Binance's own recorded entry price makes this correct
-                # regardless of which case it is.
-                await self._arm_native_stop(detail)
+                # regardless of which case it is. Stop-loss is computed
+                # ONCE here, from current equity — see module docstring.
+                equity = await self._broker.get_account_equity()
+                max_loss_usdt = equity * self._stop_loss_equity_pct / 100.0
+                self._position_stop_loss_usdt[detail.symbol] = max_loss_usdt
+                await self._arm_native_stop(detail, max_loss_usdt)
 
-            roi_pct = (detail.unrealized_pnl / self._margin_usdt * 100.0) if self._margin_usdt > 0 else 0.0
+            stop_loss_usdt = self._position_stop_loss_usdt.get(detail.symbol, 0.0)
+
+            step_size = self._step_size_lookup(detail.symbol)
+            margin_usdt = (detail.quantity * step_size * detail.entry_price / self._leverage) if self._leverage > 0 else 0.0
+            roi_pct = (detail.unrealized_pnl / margin_usdt * 100.0) if margin_usdt > 0 else 0.0
             peak_roi_pct = max(self._peak_roi_pct.get(detail.symbol, roi_pct), roi_pct)
             self._peak_roi_pct[detail.symbol] = peak_roi_pct
 
-            if detail.unrealized_pnl <= -self._stop_loss_usdt:
+            if detail.unrealized_pnl <= -stop_loss_usdt:
                 await self._close_position(
                     detail.symbol,
                     self._positions[detail.symbol],
-                    reason=f"STOP-LOSS: {detail.unrealized_pnl:.2f} USDT <= -{self._stop_loss_usdt:.0f} USDT",
+                    reason=f"STOP-LOSS: {detail.unrealized_pnl:.2f} USDT <= -{stop_loss_usdt:.0f} USDT",
                 )
             elif roi_pct >= self._hard_cap_pct:
                 # Unconditional — closes immediately without waiting for a
@@ -166,6 +193,7 @@ class PositionMonitor:
         for symbol in previous_symbols - current_symbols:
             await self._disarm_native_stop(symbol)
             self._peak_roi_pct.pop(symbol, None)
+            self._position_stop_loss_usdt.pop(symbol, None)
 
     def _trailing_stop_level(self, peak_roi_pct: float) -> float:
         """The current trailing-stop ROI% for a given peak profit reached
@@ -178,13 +206,13 @@ class PositionMonitor:
         steps = math.floor((peak_roi_pct - self._trailing_arm_pct) / self._trailing_step_increment_pct)
         return self._trailing_base_pct + steps * self._trailing_step_pct
 
-    async def _arm_native_stop(self, detail: PositionDetail) -> None:
+    async def _arm_native_stop(self, detail: PositionDetail, max_loss_usdt: float) -> None:
         order_id = await self._broker.place_stop_loss(
             detail.symbol,
             is_long=detail.side is OrderSide.BUY,
             entry_price=detail.entry_price,
             quantity_lots=detail.quantity,
-            max_loss_usdt=self._stop_loss_usdt,
+            max_loss_usdt=max_loss_usdt,
         )
         if order_id is not None:
             self._native_stop_order_id[detail.symbol] = order_id

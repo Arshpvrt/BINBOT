@@ -285,8 +285,9 @@ async def main() -> None:
     position_monitor = PositionMonitor(
         broker,
         order_manager,
-        stop_loss_usdt=sset.stop_loss_usdt,
-        margin_usdt=sset.margin_usdt,
+        stop_loss_equity_pct=sset.stop_loss_equity_pct,
+        leverage=sset.leverage,
+        step_size_lookup=broker.get_step_size,
         trailing_profit_arm_roi_pct=sset.trailing_profit_arm_roi_pct,
         trailing_profit_base_roi_pct=sset.trailing_profit_base_roi_pct,
         trailing_profit_step_roi_pct=sset.trailing_profit_step_roi_pct,
@@ -306,10 +307,12 @@ async def main() -> None:
         position_monitor=position_monitor,
         params=ScannerParams(
             max_open_positions=sset.max_open_positions,
-            order_notional_usdt=sset.order_notional_usdt,
+            margin_equity_pct=sset.margin_equity_pct,
+            leverage=sset.leverage,
             price_jump_pct=sset.price_jump_pct,
         ),
         step_size_lookup=broker.get_step_size,
+        equity_lookup=broker.get_account_equity,
     )
     scanner.attach()
 

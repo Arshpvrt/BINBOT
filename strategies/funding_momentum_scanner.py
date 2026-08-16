@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -44,7 +44,12 @@ _PENDING_ENTRY_TTL_S = 10.0
 @dataclass(frozen=True, slots=True)
 class ScannerParams:
     max_open_positions: int
-    order_notional_usdt: float
+    # Order notional is computed fresh from LIVE equity for every entry,
+    # not a fixed dollar figure — margin_equity_pct * leverage gives the
+    # same "margin then leverage" two-stage sizing the old flat margin_usdt
+    # had, just sourced from current balance instead of a config constant.
+    margin_equity_pct: float
+    leverage: float
     price_jump_pct: float
 
 
@@ -88,12 +93,14 @@ class FundingMomentumScannerStrategy(BaseStrategy):
         position_monitor: PositionMonitor,
         params: ScannerParams,
         step_size_lookup: Callable[[str], float],
+        equity_lookup: Callable[[], Awaitable[float]],
     ) -> None:
         super().__init__(strategy_id, symbols, event_bus)
         self._feed = universe_feed
         self._position_monitor = position_monitor
         self._params = params
         self._step_size_lookup = step_size_lookup
+        self._equity_lookup = equity_lookup
         # Guards against briefly overshooting max_open_positions: many
         # symbols' bars can close in the same instant (they're all bucketed
         # by wall-clock minute), but the position monitor only confirms a
@@ -125,7 +132,12 @@ class FundingMomentumScannerStrategy(BaseStrategy):
 
         step_size = self._step_size_lookup(symbol)
         price = self._feed.latest_price(symbol) or bar.close
-        lots = compute_lots(notional_usdt=self._params.order_notional_usdt, price=price, step_size=step_size)
+        # Fetched only here — once a real setup qualifies — not on every
+        # bar for every one of ~300+ scanned symbols, since this is an
+        # actual REST round-trip.
+        equity = await self._equity_lookup()
+        order_notional_usdt = equity * self._params.margin_equity_pct / 100.0 * self._params.leverage
+        lots = compute_lots(notional_usdt=order_notional_usdt, price=price, step_size=step_size)
         if lots <= 0:
             return
 

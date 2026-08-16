@@ -100,16 +100,25 @@ class ScannerStrategySettings(BaseSettings):
 
     max_open_positions: int = 4
     leverage: int = 15
-    margin_usdt: float = 50.0
+    # Order margin and stop-loss are both a % of the LIVE futures account
+    # balance rather than a flat dollar amount — margin is read fresh every
+    # time a new entry signal fires (see FundingMomentumScannerStrategy.
+    # on_bar); stop-loss is a snapshot taken once, the first time a
+    # position is seen (see PositionMonitor._check_once), and stays fixed
+    # for that position's lifetime rather than recalculating while it's
+    # held — same lifecycle the old flat $50/$200 values already had, just
+    # sourced from live equity instead of a config constant.
+    margin_equity_pct: float = 15.0
+    stop_loss_equity_pct: float = 25.0
     # Cross margin (not the ISOLATED default elsewhere): a per-position
     # stop-loss larger than that position's own isolated margin can only
     # ever be enforced in software if losses can draw from the whole
-    # account, not just the ~3.3 USDT margin backing this one position.
+    # account, not just the margin backing this one position.
     margin_type: str = "CROSSED"
-    stop_loss_usdt: float = 200.0
 
     # Profit exit is a trailing stop, not a fixed target: once unrealized
-    # ROI (against margin_usdt) first reaches trailing_profit_arm_roi_pct,
+    # ROI (against the position's actual margin) first reaches
+    # trailing_profit_arm_roi_pct,
     # a stop arms at trailing_profit_base_roi_pct and rises
     # trailing_profit_step_roi_pct for every additional
     # trailing_profit_step_increment_roi_pct of peak profit reached after
@@ -150,6 +159,13 @@ class ScannerStrategySettings(BaseSettings):
             raise ValueError("max_open_positions must be at least 1")
         return v
 
+    @field_validator("margin_equity_pct", "stop_loss_equity_pct")
+    @classmethod
+    def _validate_equity_pct(cls, v: float) -> float:
+        if not (0 < v <= 100):
+            raise ValueError("margin_equity_pct and stop_loss_equity_pct must be in (0, 100]")
+        return v
+
     @field_validator("trailing_profit_step_increment_roi_pct")
     @classmethod
     def _validate_step_increment(cls, v: float) -> float:
@@ -168,10 +184,6 @@ class ScannerStrategySettings(BaseSettings):
         if self.trailing_profit_hard_cap_roi_pct <= self.trailing_profit_arm_roi_pct:
             raise ValueError("trailing_profit_hard_cap_roi_pct must exceed trailing_profit_arm_roi_pct")
         return self
-
-    @property
-    def order_notional_usdt(self) -> float:
-        return self.margin_usdt * self.leverage
 
 
 class TelegramSettings(BaseSettings):

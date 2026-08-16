@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from core.enums import OrderSide
+from core.event_bus import EventBus
+from core.events import BarEvent
 from data.binance_universe_feed import BinanceUniverseFeed
-from strategies.funding_momentum_scanner import compute_lots, evaluate_entry
+from strategies.funding_momentum_scanner import (
+    FundingMomentumScannerStrategy,
+    ScannerParams,
+    compute_lots,
+    evaluate_entry,
+)
 
 
 class TestEvaluateEntry:
@@ -133,3 +141,67 @@ class TestBinanceUniverseFeedWindows:
 
     def test_latest_price_unknown_symbol_is_none(self, feed: BinanceUniverseFeed):
         assert feed.latest_price("NOPEUSDT") is None
+
+
+def _make_strategy(*, equity: float, margin_pct: float, leverage: float, step_size: float) -> FundingMomentumScannerStrategy:
+    event_bus = EventBus()
+    event_bus.publish = AsyncMock()
+    feed = MagicMock()
+    feed.price_change_pct.return_value = 16.0  # qualifies: >= price_jump_pct=15.0
+    feed.funding_trend.return_value = (-0.002, -0.0005)  # trending more negative -> BUY
+    feed.latest_price.return_value = 65000.0
+    position_monitor = MagicMock()
+    position_monitor.open_symbols.return_value = set()
+    return FundingMomentumScannerStrategy(
+        strategy_id="test-scanner",
+        event_bus=event_bus,
+        symbols=["BTCUSDT"],
+        universe_feed=feed,
+        position_monitor=position_monitor,
+        params=ScannerParams(
+            max_open_positions=4, margin_equity_pct=margin_pct, leverage=leverage, price_jump_pct=15.0
+        ),
+        step_size_lookup=lambda symbol: step_size,
+        equity_lookup=AsyncMock(return_value=equity),
+    )
+
+
+def _make_bar(symbol: str = "BTCUSDT", close: float = 65000.0) -> BarEvent:
+    return BarEvent(ts=datetime.now(timezone.utc), symbol=symbol, open=close, high=close, low=close, close=close, volume=1.0)
+
+
+class TestOnBarEquitySizing:
+    """Order sizing now comes from live equity * margin_equity_pct *
+    leverage (2026-08-17), computed fresh only once a real setup
+    qualifies — not a static config value baked in at construction time."""
+
+    async def test_order_notional_uses_live_equity_and_leverage(self):
+        strategy = _make_strategy(equity=1000.0, margin_pct=15.0, leverage=15.0, step_size=0.001)
+
+        await strategy.on_bar(_make_bar())
+
+        strategy._event_bus.publish.assert_awaited_once()
+        signal = strategy._event_bus.publish.call_args.args[0]
+        # notional = 1000 * 15% * 15x = 2250 -> lots = floor(2250 / (65000*0.001)) = floor(34.6) = 34
+        assert signal.side is OrderSide.BUY
+        assert signal.target_quantity == 34
+
+    async def test_higher_live_equity_produces_a_larger_order(self):
+        strategy = _make_strategy(equity=2000.0, margin_pct=15.0, leverage=15.0, step_size=0.001)
+
+        await strategy.on_bar(_make_bar())
+
+        signal = strategy._event_bus.publish.call_args.args[0]
+        # notional = 2000 * 0.15 * 15 = 4500 -> floor(4500/65) = 69
+        assert signal.target_quantity == 69
+
+    async def test_a_non_qualifying_bar_never_calls_the_equity_lookup(self):
+        strategy = _make_strategy(equity=1000.0, margin_pct=15.0, leverage=15.0, step_size=0.001)
+        strategy._feed.price_change_pct.return_value = 5.0  # below price_jump_pct=15.0 -> no signal
+
+        await strategy.on_bar(_make_bar())
+
+        # confirms sizing math (and its REST call) only runs for a real
+        # qualifying setup, not on every bar for every scanned symbol
+        strategy._equity_lookup.assert_not_awaited()
+        strategy._event_bus.publish.assert_not_awaited()

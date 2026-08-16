@@ -5,6 +5,12 @@ incident (2026-08-10): if the bot process itself is down, nothing but an
 exchange-side order protects an open position. These tests exist to catch
 exactly the class of bug that would silently defeat that backstop — an
 arm that never fires, or a disarm that leaves a stale order behind.
+
+Stop-loss and per-position margin are both equity-relative rather than
+flat dollar amounts (2026-08-17) — the fixture's step sizes are chosen so
+BTCUSDT/ETHUSDT positions land on a 50 USDT margin (matching this file's
+pre-existing ROI% test values unchanged) at leverage=15, and equity=1000
+with stop_loss_equity_pct=25 gives a 250 USDT stop-loss.
 """
 from __future__ import annotations
 
@@ -15,6 +21,17 @@ import pytest
 from core.enums import OrderSide
 from execution.binance_broker import PositionDetail
 from execution.position_monitor import PositionMonitor
+
+LEVERAGE = 15.0
+EQUITY = 1000.0
+STOP_LOSS_USDT = EQUITY * 25.0 / 100.0  # 250.0
+
+# Chosen so quantity * step_size * entry_price / LEVERAGE == 50.0 for each
+# symbol's fixed (qty, entry) pair used throughout this file.
+_STEP_SIZE = {
+    "BTCUSDT": 50.0 * LEVERAGE / (15 * 65000.0),
+    "ETHUSDT": 50.0 * LEVERAGE / (100 * 1900.0),
+}
 
 
 def detail(symbol: str, *, side: OrderSide, qty: int, entry: float, unrealized: float) -> PositionDetail:
@@ -27,6 +44,7 @@ def detail(symbol: str, *, side: OrderSide, qty: int, entry: float, unrealized: 
 def broker() -> AsyncMock:
     b = AsyncMock()
     b.place_stop_loss.return_value = "native-order-1"
+    b.get_account_equity.return_value = EQUITY
     return b
 
 
@@ -40,8 +58,9 @@ def monitor(broker: AsyncMock, order_manager: AsyncMock) -> PositionMonitor:
     return PositionMonitor(
         broker,
         order_manager,
-        stop_loss_usdt=200.0,
-        margin_usdt=50.0,
+        stop_loss_equity_pct=25.0,
+        leverage=LEVERAGE,
+        step_size_lookup=lambda symbol: _STEP_SIZE[symbol],
         trailing_profit_arm_roi_pct=30.0,
         trailing_profit_base_roi_pct=20.0,
         trailing_profit_step_roi_pct=2.0,
@@ -59,7 +78,7 @@ class TestNativeStopArmingAndDisarming:
         await monitor._check_once()
 
         broker.place_stop_loss.assert_awaited_once_with(
-            "BTCUSDT", is_long=True, entry_price=65000.0, quantity_lots=15, max_loss_usdt=200.0
+            "BTCUSDT", is_long=True, entry_price=65000.0, quantity_lots=15, max_loss_usdt=STOP_LOSS_USDT
         )
         assert monitor._native_stop_order_id["BTCUSDT"] == "native-order-1"
 
@@ -104,7 +123,7 @@ class TestNativeStopArmingAndDisarming:
         await monitor._check_once()
 
         broker.place_stop_loss.assert_awaited_once_with(
-            "ETHUSDT", is_long=False, entry_price=1900.0, quantity_lots=100, max_loss_usdt=200.0
+            "ETHUSDT", is_long=False, entry_price=1900.0, quantity_lots=100, max_loss_usdt=STOP_LOSS_USDT
         )
 
 
@@ -113,7 +132,7 @@ class TestSoftwareExitLogic:
         self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
     ):
         broker.get_position_details.return_value = [
-            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=-201.0)
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=-251.0)  # past the 250 USDT stop
         ]
 
         await monitor._check_once()
@@ -128,7 +147,7 @@ class TestSoftwareExitLogic:
         self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
     ):
         broker.get_position_details.return_value = [
-            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=-250.0)
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=-260.0)
         ]
 
         await monitor._check_once()
@@ -148,6 +167,84 @@ class TestSoftwareExitLogic:
         order_manager.submit.assert_not_awaited()
         assert monitor.open_symbols() == {"BTCUSDT"}
         assert monitor.open_count() == 1
+
+
+class TestStopLossIsSnapshotAtEntry:
+    """The whole point of this design: the dollar stop-loss is computed
+    ONCE, from equity at the moment a position is first seen, and must
+    never move again for that position — not even if the account balance
+    changes wildly on a later poll."""
+
+    async def test_stop_loss_is_recorded_at_arm_time_from_current_equity(
+        self, monitor: PositionMonitor, broker: AsyncMock
+    ):
+        broker.get_account_equity.return_value = 500.0  # -> 125 USDT stop-loss
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=5.0)
+        ]
+
+        await monitor._check_once()
+
+        broker.place_stop_loss.assert_awaited_once_with(
+            "BTCUSDT", is_long=True, entry_price=65000.0, quantity_lots=15, max_loss_usdt=125.0
+        )
+        assert monitor._position_stop_loss_usdt["BTCUSDT"] == pytest.approx(125.0)
+
+    async def test_stop_loss_does_not_change_if_equity_changes_after_entry(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        broker.get_account_equity.return_value = 1000.0  # armed at 250 USDT
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=5.0)
+        ]
+        await monitor._check_once()
+        assert monitor._position_stop_loss_usdt["BTCUSDT"] == pytest.approx(250.0)
+
+        # equity balloons 10x on a later poll — must NOT retroactively loosen this position's stop
+        broker.get_account_equity.return_value = 10_000.0
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=-251.0)
+        ]
+        await monitor._check_once()
+
+        # still closes at the ORIGINAL 250 USDT threshold, not a new 2500 USDT one
+        order_manager.submit.assert_awaited_once()
+        assert monitor._position_stop_loss_usdt["BTCUSDT"] == pytest.approx(250.0)
+
+    async def test_stop_loss_tracking_is_cleared_on_close(self, monitor: PositionMonitor, broker: AsyncMock):
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=5.0)
+        ]
+        await monitor._check_once()
+        assert "BTCUSDT" in monitor._position_stop_loss_usdt
+
+        broker.get_position_details.return_value = []
+        await monitor._check_once()
+
+        assert "BTCUSDT" not in monitor._position_stop_loss_usdt
+
+
+class TestPerPositionMarginComputation:
+    """ROI% is no longer against one global margin constant — each
+    position's margin is derived from what Binance actually reports for
+    IT (quantity * step_size * entry_price / leverage)."""
+
+    async def test_roi_pct_uses_this_positions_own_margin_not_a_shared_constant(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        # SOLUSDT: qty=200, entry=150.0, leverage=15 -> margin=100 with step_size=0.05
+        # (double the 50 USDT margin every other fixture position uses)
+        monitor._step_size_lookup = lambda symbol: 0.05 if symbol == "SOLUSDT" else _STEP_SIZE[symbol]
+        broker.get_position_details.return_value = [
+            detail("SOLUSDT", side=OrderSide.BUY, qty=200, entry=150.0, unrealized=30.0)
+        ]
+
+        await monitor._check_once()
+
+        # 30 unrealized / 100 margin = 30.0% ROI exactly — if this were
+        # still computed against a global 50 USDT margin it would read
+        # 60.0% instead, a materially different (and wrong) number.
+        assert monitor._peak_roi_pct["SOLUSDT"] == pytest.approx(30.0)
 
 
 class TestTrailingStopLevelFormula:
@@ -173,8 +270,9 @@ class TestTrailingStopLevelFormula:
 
 
 class TestTrailingProfitExitLogic:
-    """margin_usdt=50.0 in the fixture, so ROI% * 0.5 = unrealized USDT —
-    e.g. 30% ROI is unrealized=15.0, 20% ROI is unrealized=10.0."""
+    """Every position here has a 50 USDT margin (via the fixture's chosen
+    step sizes), so ROI% * 0.5 = unrealized USDT — e.g. 30% ROI is
+    unrealized=15.0, 20% ROI is unrealized=10.0."""
 
     async def test_reaching_the_arm_threshold_alone_does_not_close(
         self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
@@ -282,7 +380,7 @@ class TestTrailingProfitExitLogic:
 
 
 class TestProfitHardCap:
-    """margin_usdt=50.0 in the fixture, so 80% ROI is unrealized=40.0."""
+    """Every position here has a 50 USDT margin, so 80% ROI is unrealized=40.0."""
 
     async def test_hard_cap_closes_immediately_without_waiting_for_a_pullback(
         self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
@@ -332,8 +430,9 @@ class TestProfitHardCap:
         monitor = PositionMonitor(
             broker,
             order_manager,
-            stop_loss_usdt=200.0,
-            margin_usdt=50.0,
+            stop_loss_equity_pct=25.0,
+            leverage=LEVERAGE,
+            step_size_lookup=lambda symbol: _STEP_SIZE[symbol],
             trailing_profit_arm_roi_pct=30.0,
             trailing_profit_base_roi_pct=20.0,
             trailing_profit_step_roi_pct=2.0,
