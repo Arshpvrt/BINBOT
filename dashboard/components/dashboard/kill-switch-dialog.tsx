@@ -13,10 +13,16 @@ export function KillSwitchDialog({ store }: { store: UseBoundStore<StoreApi<Trad
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState<1 | 2>(1);
   const killSwitchEngaged = store((s) => s.killSwitchEngaged);
+  const circuitBreakerHalted = store((s) => s.risk.circuitBreakerHalted);
   const triggerKillSwitch = store((s) => s.triggerKillSwitch);
   const resetKillSwitch = store((s) => s.resetKillSwitch);
 
-  if (killSwitchEngaged) {
+  // circuitBreakerHalted covers a halt the RISK ENGINE tripped on its own
+  // (e.g. a daily drawdown breach) — killSwitchEngaged only ever becomes
+  // true from clicking the button below in THIS browser tab. Gating the
+  // reset button on killSwitchEngaged alone meant an automatic halt had no
+  // way to be cleared from the dashboard at all.
+  if (killSwitchEngaged || circuitBreakerHalted) {
     return (
       <Button
         variant="loss"
