@@ -406,6 +406,16 @@ async def main() -> None:
                 if circuit_breaker.update(equity):
                     logger.critical("circuit_breaker.tripped_cancelling_all_orders")
                     await order_manager.cancel_all()
+                if circuit_breaker.consume_auto_reset_flag():
+                    logger.info("circuit_breaker.new_day_auto_resumed")
+                    await dashboard_bridge.push_audit(
+                        level="info",
+                        source="circuit_breaker",
+                        message="New trading day: daily drawdown limit auto-reset, trading resumed",
+                    )
+                    await notifier.send(
+                        "🟢 *New trading day* — daily drawdown limit reset automatically, trading resumed"
+                    )
                 recovery.persist()
             except Exception:
                 # A single failed Binance call here (rate limit, network

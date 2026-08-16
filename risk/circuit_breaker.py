@@ -1,7 +1,11 @@
 """Hard kill-switch: halts all order generation the instant daily P&L breaches
-a configured drawdown threshold. Once tripped, it stays tripped until a new
-trading session explicitly resets it — there is no automatic recovery, by
-design, so a runaway strategy cannot re-trip and un-trip its way past risk.
+a configured drawdown threshold. Once tripped, it stays tripped for the rest
+of that trading day — there is no same-day automatic recovery, by design, so
+a runaway strategy cannot re-trip and un-trip its way past risk within one
+session. A new calendar day IS a new trading session, though, and starts a
+fresh drawdown budget automatically (see `update()`) — a halt is a "stop for
+today," not a permanent kill, unless something else (an operator, or state
+recovery restoring a still-halted snapshot) says otherwise.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ class DrawdownCircuitBreaker:
     _peak_equity: float = field(init=False)
     _halted: bool = field(default=False, init=False)
     _halt_reason: str = field(default="", init=False)
+    _auto_reset_pending: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if self.starting_equity <= 0:
@@ -36,6 +41,15 @@ class DrawdownCircuitBreaker:
     @property
     def halt_reason(self) -> str:
         return self._halt_reason
+
+    def consume_auto_reset_flag(self) -> bool:
+        """True exactly once, immediately after an `update()` call that
+        auto-reset the session for a new calendar day — lets the caller
+        push a one-time operator notification (audit line, Telegram) for
+        it instead of this being silently invisible outside the logs."""
+        flag = self._auto_reset_pending
+        self._auto_reset_pending = False
+        return flag
 
     def reset_session(self, starting_equity: float, *, session_date: date | None = None) -> None:
         """Must be called explicitly at the start of a new trading day.
@@ -86,15 +100,32 @@ class DrawdownCircuitBreaker:
         """Feed the latest mark-to-market equity. Returns True if this call
         newly tripped the breaker (so the caller can emit a RiskHaltEvent
         exactly once).
+
+        A calendar-day rollover is treated as the start of a new trading
+        session: this auto-resets (fresh starting/peak equity, halt
+        cleared) exactly like an explicit `reset_session()` call would,
+        rather than leaving a halt from the prior day in effect
+        indefinitely — which is what happened before this fix, on any
+        deployment where the process stays up across midnight instead of
+        restarting (restarts already got a fresh session via
+        `utils.state_recovery`, which is the only reason this gap wasn't
+        caught immediately). Call `consume_auto_reset_flag()` right after
+        this to notify an operator that it happened.
         """
         now = now or datetime.now(timezone.utc)
         if now.date() != self._session_date:
-            logger.warning(
-                "circuit_breaker.stale_session",
-                session_date=str(self._session_date),
-                now_date=str(now.date()),
-                msg="update() called on a new calendar day without reset_session()",
+            was_halted = self._halted
+            previous_session_date = self._session_date
+            self.reset_session(current_equity, session_date=now.date())
+            self._auto_reset_pending = True
+            logger.info(
+                "circuit_breaker.new_day_auto_reset",
+                previous_session_date=str(previous_session_date),
+                new_session_date=str(now.date()),
+                was_halted=was_halted,
+                new_starting_equity=current_equity,
             )
+            return False
 
         self._peak_equity = max(self._peak_equity, current_equity)
 

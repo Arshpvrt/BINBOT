@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -102,6 +102,54 @@ class TestCircuitBreakerGate:
         )
         assert fresh.is_halted
         assert fresh.halt_reason == circuit_breaker.halt_reason
+
+
+class TestDayRolloverAutoReset:
+    """A halt is a 'stop for today,' not a permanent kill. Before this fix,
+    update() only logged a warning on a day change instead of resetting —
+    meaning a halt from a drawdown breach stayed in effect forever on any
+    deployment where the process keeps running across midnight instead of
+    restarting (a restart got a fresh session for free via
+    utils.state_recovery, which is exactly why this gap went unnoticed)."""
+
+    def test_a_new_calendar_day_clears_an_existing_halt(self, circuit_breaker):
+        circuit_breaker.force_halt("yesterday's drawdown breach")
+        tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+
+        tripped = circuit_breaker.update(1_000_000.0, now=tomorrow)
+
+        assert tripped is False
+        assert not circuit_breaker.is_halted
+
+    def test_same_day_updates_never_auto_reset_a_halt(self, circuit_breaker):
+        circuit_breaker.force_halt("same-day breach")
+
+        circuit_breaker.update(1_000_000.0)  # no now= override — still "today"
+
+        assert circuit_breaker.is_halted  # must stay halted within the same session
+
+    def test_new_day_starts_a_fresh_drawdown_budget_from_current_equity(self, circuit_breaker):
+        circuit_breaker.update(981_000.0)  # -1.9%, close to the 2% limit but not tripped
+        tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+        circuit_breaker.update(981_000.0, now=tomorrow)  # day rollover: this becomes the new baseline
+
+        # a further small dip from the NEW baseline must not immediately re-trip
+        tripped = circuit_breaker.update(975_000.0, now=tomorrow)
+
+        assert tripped is False
+        assert not circuit_breaker.is_halted
+
+    def test_auto_reset_flag_is_set_once_then_clears(self, circuit_breaker):
+        tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+        circuit_breaker.update(1_000_000.0, now=tomorrow)
+
+        assert circuit_breaker.consume_auto_reset_flag() is True
+        assert circuit_breaker.consume_auto_reset_flag() is False
+
+    def test_auto_reset_flag_is_false_for_an_ordinary_same_day_update(self, circuit_breaker):
+        circuit_breaker.update(999_000.0)
+
+        assert circuit_breaker.consume_auto_reset_flag() is False
 
 
 class TestPositionAndNotionalLimits:
