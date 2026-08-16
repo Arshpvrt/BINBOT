@@ -55,7 +55,7 @@ class TestEquityPctValidators:
 
     def test_defaults_are_valid(self):
         settings = ScannerStrategySettings()
-        assert settings.margin_equity_pct == 15.0
+        assert settings.margin_equity_pct == 5.0
         assert settings.stop_loss_equity_pct == 25.0
 
     def test_zero_margin_pct_is_rejected(self):

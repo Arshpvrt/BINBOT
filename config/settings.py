@@ -108,7 +108,7 @@ class ScannerStrategySettings(BaseSettings):
     # for that position's lifetime rather than recalculating while it's
     # held — same lifecycle the old flat $50/$200 values already had, just
     # sourced from live equity instead of a config constant.
-    margin_equity_pct: float = 15.0
+    margin_equity_pct: float = 5.0
     stop_loss_equity_pct: float = 25.0
     # Cross margin (not the ISOLATED default elsewhere): a per-position
     # stop-loss larger than that position's own isolated margin can only
