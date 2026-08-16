@@ -73,12 +73,30 @@ class BinanceUniverseFeed:
         if self._task is not None:
             self._task.cancel()
 
-    async def backfill(self, client: "AsyncClient", symbols: list[str], *, concurrency: int = 15) -> None:
+    async def backfill(
+        self,
+        client: "AsyncClient",
+        symbols: list[str],
+        *,
+        batch_size: int = 20,
+        batch_delay_s: float = 1.0,
+    ) -> None:
         """Seed price/funding history from historical klines, covering the
         same span as the live rolling windows, before `start()` begins
         streaming. Must be called before `start()` — it appends points in
         chronological order and the rolling-window trim logic assumes
         history stays ordered oldest-to-newest.
+
+        Processes `symbols` in batches of `batch_size` with a
+        `batch_delay_s` pause between batches, rather than firing every
+        symbol's 2 REST calls at once — with a large universe (~300-800
+        symbols) an unpaced burst is enough to trip Binance's per-IP
+        rate limit (a real -1003 IP ban was observed in production from
+        exactly this: ~1500 calls completing in a handful of seconds).
+        At the defaults this spreads the same total call volume over
+        roughly `len(symbols) / batch_size` seconds instead — a one-time
+        startup cost, not a hot path, so trading the burst for a slower
+        but safe ramp-up is a clear win.
 
         Funding rate has no historical series of its own on Binance (only
         realized 8-hourly settlements, not the continuously-updating
@@ -88,34 +106,38 @@ class BinanceUniverseFeed:
         """
         price_limit = max(2, math.ceil(self._price_window.total_seconds() / 60) + 1)
         funding_limit = max(2, math.ceil(self._funding_window.total_seconds() / 60) + 1)
-        sem = asyncio.Semaphore(concurrency)
         filled = 0
         failed = 0
 
         async def backfill_one(symbol: str) -> None:
             nonlocal filled, failed
-            async with sem:
-                try:
-                    price_klines, funding_klines = await asyncio.gather(
-                        client.futures_mark_price_klines(symbol=symbol, interval="1m", limit=price_limit),
-                        client.futures_premium_index_klines(symbol=symbol, interval="1m", limit=funding_limit),
-                    )
-                except Exception as exc:
-                    failed += 1
-                    logger.debug("universe_feed.backfill_symbol_failed", symbol=symbol, error=str(exc))
-                    return
-                for row in price_klines:
-                    ts = datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc)
-                    self._append_trimmed(self._price_history[symbol], ts, float(row[4]), self._price_window)
-                if price_klines:
-                    self._latest_price[symbol] = float(price_klines[-1][4])
-                for row in funding_klines:
-                    ts = datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc)
-                    self._append_trimmed(self._funding_history[symbol], ts, float(row[4]), self._funding_window)
-                filled += 1
+            try:
+                price_klines, funding_klines = await asyncio.gather(
+                    client.futures_mark_price_klines(symbol=symbol, interval="1m", limit=price_limit),
+                    client.futures_premium_index_klines(symbol=symbol, interval="1m", limit=funding_limit),
+                )
+            except Exception as exc:
+                failed += 1
+                logger.debug("universe_feed.backfill_symbol_failed", symbol=symbol, error=str(exc))
+                return
+            for row in price_klines:
+                ts = datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc)
+                self._append_trimmed(self._price_history[symbol], ts, float(row[4]), self._price_window)
+            if price_klines:
+                self._latest_price[symbol] = float(price_klines[-1][4])
+            for row in funding_klines:
+                ts = datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc)
+                self._append_trimmed(self._funding_history[symbol], ts, float(row[4]), self._funding_window)
+            filled += 1
 
-        logger.info("universe_feed.backfill_starting", symbol_count=len(symbols))
-        await asyncio.gather(*(backfill_one(s) for s in symbols))
+        logger.info(
+            "universe_feed.backfill_starting", symbol_count=len(symbols), batch_size=batch_size, batch_delay_s=batch_delay_s
+        )
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i : i + batch_size]
+            await asyncio.gather(*(backfill_one(s) for s in batch))
+            if i + batch_size < len(symbols):
+                await asyncio.sleep(batch_delay_s)
         logger.info("universe_feed.backfill_complete", filled=filled, failed=failed)
 
     def latest_price(self, symbol: str) -> float | None:

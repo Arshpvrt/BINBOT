@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -141,6 +142,53 @@ class TestBinanceUniverseFeedWindows:
 
     def test_latest_price_unknown_symbol_is_none(self, feed: BinanceUniverseFeed):
         assert feed.latest_price("NOPEUSDT") is None
+
+
+class TestBackfillPacing:
+    """A real Binance IP ban (2026-08-16) traced back to backfill() firing
+    every symbol's REST calls in one unpaced burst (~1500 calls completing
+    in a handful of seconds for a ~780-symbol universe) — these tests pin
+    the batching behavior that replaced it, so a future edit can't
+    silently reintroduce the burst."""
+
+    def _client(self) -> AsyncMock:
+        client = AsyncMock()
+        client.futures_mark_price_klines.return_value = []
+        client.futures_premium_index_klines.return_value = []
+        return client
+
+    async def test_processes_symbols_in_batches_with_a_sleep_between(
+        self, feed: BinanceUniverseFeed, monkeypatch: pytest.MonkeyPatch
+    ):
+        client = self._client()
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        symbols = [f"SYM{i}USDT" for i in range(45)]
+
+        await feed.backfill(client, symbols, batch_size=20, batch_delay_s=0.5)
+
+        # 45 symbols / batch_size 20 -> 3 batches -> exactly 2 sleeps between them
+        assert sleep_calls == [0.5, 0.5]
+        assert client.futures_mark_price_klines.await_count == 45
+
+    async def test_no_sleep_needed_when_everything_fits_in_one_batch(
+        self, feed: BinanceUniverseFeed, monkeypatch: pytest.MonkeyPatch
+    ):
+        client = self._client()
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        await feed.backfill(client, ["AUSDT", "BUSDT"], batch_size=20, batch_delay_s=0.5)
+
+        assert sleep_calls == []
 
 
 def _make_strategy(*, equity: float, margin_pct: float, leverage: float, step_size: float) -> FundingMomentumScannerStrategy:
