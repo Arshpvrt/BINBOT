@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import signal
 import sys
 from datetime import datetime, timezone
@@ -137,7 +138,19 @@ async def main() -> None:
         # already bulk-loaded above).
         risk_engine.set_contract_multiplier(symbol, broker.get_step_size(symbol))
 
-    recovery = StateRecoveryService(broker=broker, risk_engine=risk_engine, circuit_breaker=circuit_breaker)
+    # Identifies which account/environment a persisted circuit-breaker
+    # snapshot belongs to — a testnet<->live switch (or a live key
+    # rotation) changes this, so a same-day snapshot from a different
+    # account is never mistaken for this account's own history. See
+    # utils/state_recovery.py's module docstring for the 2026-08-16
+    # incident that prompted this (a testnet baseline got compared
+    # against a live account's real balance and tripped a bogus halt).
+    key_fingerprint = hashlib.sha256(bset.api_key.get_secret_value().encode()).hexdigest()[:12]
+    environment_id = f"{'testnet' if bset.testnet else 'live'}:{key_fingerprint}"
+
+    recovery = StateRecoveryService(
+        broker=broker, risk_engine=risk_engine, circuit_breaker=circuit_breaker, environment_id=environment_id
+    )
     recovery_result = await recovery.recover()
     logger.info("state_recovery.result", **dataclasses.asdict(recovery_result))
 
