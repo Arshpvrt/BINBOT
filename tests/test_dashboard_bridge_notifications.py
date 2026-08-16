@@ -127,17 +127,17 @@ class TestCloseNotification:
 
         assert any("STOP-LOSS HIT" in m for m in notifier.sent)
 
-    async def test_close_with_recorded_take_profit_reason_labels_correctly(self):
+    async def test_close_with_recorded_trailing_profit_reason_labels_correctly(self):
         notifier = _FakeNotifier()
         bridge, order_manager = _make_bridge(notifier=notifier, trade_tracker=TradeTracker(lambda s: 1.0))
         order_manager.get_order.return_value = _managed_order("o1", "ETHUSDT", OrderSide.SELL)
         await bridge._handle_order_event(_execution("ETHUSDT", OrderSide.SELL, 100, 1900.0, "o1"))
 
-        bridge.note_close_reason("ETHUSDT", "TAKE-PROFIT: 16.00 USDT >= 15 USDT")
+        bridge.note_close_reason("ETHUSDT", "TRAILING-PROFIT: 19.00% ROI <= trail 20.00% (peak 32.00%)")
         order_manager.get_order.return_value = _managed_order("o2", "ETHUSDT", OrderSide.BUY)
         await bridge._handle_order_event(_execution("ETHUSDT", OrderSide.BUY, 100, 1884.0, "o2"))
 
-        assert any("TAKE-PROFIT HIT" in m for m in notifier.sent)
+        assert any("TRAILING-PROFIT HIT" in m for m in notifier.sent)
 
     async def test_recorded_reason_does_not_leak_into_a_later_unrelated_close(self):
         notifier = _FakeNotifier()

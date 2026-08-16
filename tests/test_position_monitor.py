@@ -37,7 +37,16 @@ def order_manager() -> AsyncMock:
 
 @pytest.fixture
 def monitor(broker: AsyncMock, order_manager: AsyncMock) -> PositionMonitor:
-    return PositionMonitor(broker, order_manager, stop_loss_usdt=200.0, take_profit_usdt=15.0)
+    return PositionMonitor(
+        broker,
+        order_manager,
+        stop_loss_usdt=200.0,
+        margin_usdt=50.0,
+        trailing_profit_arm_roi_pct=30.0,
+        trailing_profit_base_roi_pct=20.0,
+        trailing_profit_step_roi_pct=2.0,
+        trailing_profit_step_increment_roi_pct=5.0,
+    )
 
 
 class TestNativeStopArmingAndDisarming:
@@ -114,19 +123,6 @@ class TestSoftwareExitLogic:
         assert signal.side is OrderSide.SELL
         assert signal.target_quantity == 15
 
-    async def test_take_profit_triggers_a_closing_buy_for_a_short(
-        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
-    ):
-        broker.get_position_details.return_value = [
-            detail("ETHUSDT", side=OrderSide.SELL, qty=100, entry=1900.0, unrealized=16.0)
-        ]
-
-        await monitor._check_once()
-
-        signal = order_manager.submit.call_args.args[0]
-        assert signal.side is OrderSide.BUY
-        assert signal.target_quantity == 100
-
     async def test_a_closing_symbol_is_not_re_triggered_next_poll(
         self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
     ):
@@ -151,3 +147,134 @@ class TestSoftwareExitLogic:
         order_manager.submit.assert_not_awaited()
         assert monitor.open_symbols() == {"BTCUSDT"}
         assert monitor.open_count() == 1
+
+
+class TestTrailingStopLevelFormula:
+    """Pure formula checks, independent of the polling loop: base 20% once
+    armed at 30% peak, +2% for every additional 5% of peak profit."""
+
+    @pytest.mark.parametrize(
+        "peak_pct,expected_level",
+        [
+            (30.0, 20.0),
+            (34.9, 20.0),  # not yet a full 5% past arm — still the base level
+            (35.0, 22.0),
+            (39.9, 22.0),
+            (40.0, 24.0),
+            (44.9, 24.0),
+            (45.0, 26.0),
+        ],
+    )
+    def test_stop_level_steps_up_every_5pct_of_peak_profit(
+        self, monitor: PositionMonitor, peak_pct: float, expected_level: float
+    ):
+        assert monitor._trailing_stop_level(peak_pct) == pytest.approx(expected_level)
+
+
+class TestTrailingProfitExitLogic:
+    """margin_usdt=50.0 in the fixture, so ROI% * 0.5 = unrealized USDT —
+    e.g. 30% ROI is unrealized=15.0, 20% ROI is unrealized=10.0."""
+
+    async def test_reaching_the_arm_threshold_alone_does_not_close(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=15.0)  # exactly 30% ROI
+        ]
+
+        await monitor._check_once()
+
+        order_manager.submit.assert_not_awaited()
+
+    async def test_pullback_below_base_trail_closes_a_long(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        # peak 32% ROI (unrealized=16.0) arms the trail at the 20% base level
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=16.0)
+        ]
+        await monitor._check_once()
+        order_manager.submit.assert_not_awaited()
+
+        # pulls back to 19% ROI (unrealized=9.5) — below the 20% base trail
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=9.5)
+        ]
+        await monitor._check_once()
+
+        order_manager.submit.assert_awaited_once()
+        signal = order_manager.submit.call_args.args[0]
+        assert signal.side is OrderSide.SELL  # closes a long
+        assert signal.target_quantity == 15
+
+    async def test_pullback_below_base_trail_closes_a_short(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        broker.get_position_details.return_value = [
+            detail("ETHUSDT", side=OrderSide.SELL, qty=100, entry=1900.0, unrealized=16.0)
+        ]
+        await monitor._check_once()
+
+        broker.get_position_details.return_value = [
+            detail("ETHUSDT", side=OrderSide.SELL, qty=100, entry=1900.0, unrealized=9.5)
+        ]
+        await monitor._check_once()
+
+        signal = order_manager.submit.call_args.args[0]
+        assert signal.side is OrderSide.BUY  # closes a short
+        assert signal.target_quantity == 100
+
+    async def test_stop_level_rises_with_peak_and_still_requires_a_pullback(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        # peak reaches 40% ROI (unrealized=20.0) -> trail level rises to 24%
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=20.0)
+        ]
+        await monitor._check_once()
+
+        # dips to 25% ROI (unrealized=12.5) — above the new 24% trail, must NOT close
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=12.5)
+        ]
+        await monitor._check_once()
+        order_manager.submit.assert_not_awaited()
+
+        # dips further to 23% ROI (unrealized=11.5) — at/below the 24% trail, closes
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=11.5)
+        ]
+        await monitor._check_once()
+        order_manager.submit.assert_awaited_once()
+
+    async def test_a_dip_that_never_reached_the_arm_threshold_never_closes(
+        self, monitor: PositionMonitor, broker: AsyncMock, order_manager: AsyncMock
+    ):
+        # peak only 25% ROI — never armed the trail
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=12.5)
+        ]
+        await monitor._check_once()
+
+        # small pullback to 5% ROI — still well above stop-loss, and the
+        # trail was never armed, so this must not trigger a close
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=2.5)
+        ]
+        await monitor._check_once()
+
+        order_manager.submit.assert_not_awaited()
+
+    async def test_peak_roi_tracking_is_cleared_when_the_position_closes(
+        self, monitor: PositionMonitor, broker: AsyncMock
+    ):
+        broker.get_position_details.return_value = [
+            detail("BTCUSDT", side=OrderSide.BUY, qty=15, entry=65000.0, unrealized=16.0)
+        ]
+        await monitor._check_once()
+        assert "BTCUSDT" in monitor._peak_roi_pct
+
+        broker.get_position_details.return_value = []  # closed elsewhere (e.g. manual flatten)
+        await monitor._check_once()
+
+        assert "BTCUSDT" not in monitor._peak_roi_pct

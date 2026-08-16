@@ -465,8 +465,8 @@ class DashboardBridge:
                         reason = self._close_reasons.pop(closed.symbol, "")
                         if reason.startswith("STOP-LOSS"):
                             label = "🔴 *STOP-LOSS HIT*"
-                        elif reason.startswith("TAKE-PROFIT"):
-                            label = "🟢 *TAKE-PROFIT HIT*"
+                        elif reason.startswith("TRAILING-PROFIT"):
+                            label = "🟢 *TRAILING-PROFIT HIT*"
                         else:
                             label = "⚪ *Position closed*"
                         await self._notifier.send(

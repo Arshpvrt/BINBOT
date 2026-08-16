@@ -1,7 +1,15 @@
 """Continuously watches every open position's real unrealized P&L (read
 directly from Binance, not recomputed locally — see
 `BinanceFuturesBroker.get_position_details`) and closes a position the
-instant it crosses the stop-loss or take-profit threshold.
+instant it hits the stop-loss threshold or a trailing profit stop.
+
+The profit exit is a trailing stop, not a fixed target: once a position's
+unrealized ROI (against margin_usdt) first reaches `trailing_arm_pct`, a
+stop arms at `trailing_base_pct` and rises `trailing_step_pct` for every
+additional `trailing_step_increment_pct` of PEAK profit reached after
+that — see `_trailing_stop_level()`. The position closes once ROI pulls
+back down to whatever that trailing level currently is, so a strong move
+keeps running instead of every winner getting capped at the same target.
 
 Also arms a native, exchange-side stop-loss order the moment a position is
 first seen, and disarms it once the position is closed by any other means
@@ -9,6 +17,9 @@ first seen, and disarms it once the position is closed by any other means
 check is the primary, faster mechanism while the bot is running; the native
 order is strictly a backstop for the gap where it isn't — a crash, a
 restart, the server rebooting — see `BinanceFuturesBroker.place_stop_loss`.
+The trailing-profit stop has no native-exchange equivalent (Binance's own
+trailing-stop order type only supports a constant callback rate, not this
+stepped formula), so profit exits are software-only.
 
 This is also the single shared source of truth for "how many positions are
 open right now" and "which symbols" — the scanner strategy queries it
@@ -19,6 +30,7 @@ here, rather than each polling the exchange independently).
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -38,7 +50,11 @@ class PositionMonitor:
         order_manager: OrderLifecycleManager,
         *,
         stop_loss_usdt: float,
-        take_profit_usdt: float,
+        margin_usdt: float,
+        trailing_profit_arm_roi_pct: float,
+        trailing_profit_base_roi_pct: float,
+        trailing_profit_step_roi_pct: float,
+        trailing_profit_step_increment_roi_pct: float,
         poll_interval_s: float = 2.0,
         on_close_event: Callable[[str, str], "asyncio.Future[None] | None"] | None = None,
         price_lookup: Callable[[str], float | None] | None = None,
@@ -46,7 +62,11 @@ class PositionMonitor:
         self._broker = broker
         self._order_manager = order_manager
         self._stop_loss_usdt = stop_loss_usdt
-        self._take_profit_usdt = take_profit_usdt
+        self._margin_usdt = margin_usdt
+        self._trailing_arm_pct = trailing_profit_arm_roi_pct
+        self._trailing_base_pct = trailing_profit_base_roi_pct
+        self._trailing_step_pct = trailing_profit_step_roi_pct
+        self._trailing_step_increment_pct = trailing_profit_step_increment_roi_pct
         self._poll_interval_s = poll_interval_s
         self._on_close_event = on_close_event
         self._price_lookup = price_lookup
@@ -54,6 +74,7 @@ class PositionMonitor:
         self._positions: dict[str, int] = {}
         self._closing: set[str] = set()
         self._native_stop_order_id: dict[str, str] = {}
+        self._peak_roi_pct: dict[str, float] = {}
         self._task: asyncio.Task[None] | None = None
         self._running = False
 
@@ -69,7 +90,10 @@ class PositionMonitor:
         logger.info(
             "position_monitor.started",
             stop_loss_usdt=self._stop_loss_usdt,
-            take_profit_usdt=self._take_profit_usdt,
+            trailing_profit_arm_pct=self._trailing_arm_pct,
+            trailing_profit_base_pct=self._trailing_base_pct,
+            trailing_profit_step_pct=self._trailing_step_pct,
+            trailing_profit_step_increment_pct=self._trailing_step_increment_pct,
             poll_interval_s=self._poll_interval_s,
         )
 
@@ -103,21 +127,43 @@ class PositionMonitor:
                 # Binance's own recorded entry price makes this correct
                 # regardless of which case it is.
                 await self._arm_native_stop(detail)
+
+            roi_pct = (detail.unrealized_pnl / self._margin_usdt * 100.0) if self._margin_usdt > 0 else 0.0
+            peak_roi_pct = max(self._peak_roi_pct.get(detail.symbol, roi_pct), roi_pct)
+            self._peak_roi_pct[detail.symbol] = peak_roi_pct
+
             if detail.unrealized_pnl <= -self._stop_loss_usdt:
                 await self._close_position(
                     detail.symbol,
                     self._positions[detail.symbol],
                     reason=f"STOP-LOSS: {detail.unrealized_pnl:.2f} USDT <= -{self._stop_loss_usdt:.0f} USDT",
                 )
-            elif detail.unrealized_pnl >= self._take_profit_usdt:
-                await self._close_position(
-                    detail.symbol,
-                    self._positions[detail.symbol],
-                    reason=f"TAKE-PROFIT: {detail.unrealized_pnl:.2f} USDT >= {self._take_profit_usdt:.0f} USDT",
-                )
+            elif peak_roi_pct >= self._trailing_arm_pct:
+                trail_level_pct = self._trailing_stop_level(peak_roi_pct)
+                if roi_pct <= trail_level_pct:
+                    await self._close_position(
+                        detail.symbol,
+                        self._positions[detail.symbol],
+                        reason=(
+                            f"TRAILING-PROFIT: {roi_pct:.2f}% ROI <= trail {trail_level_pct:.2f}% "
+                            f"(peak {peak_roi_pct:.2f}%)"
+                        ),
+                    )
 
         for symbol in previous_symbols - current_symbols:
             await self._disarm_native_stop(symbol)
+            self._peak_roi_pct.pop(symbol, None)
+
+    def _trailing_stop_level(self, peak_roi_pct: float) -> float:
+        """The current trailing-stop ROI% for a given peak profit reached
+        so far: `trailing_base_pct` once peak first reaches
+        `trailing_arm_pct`, then +`trailing_step_pct` for every additional
+        `trailing_step_increment_pct` of peak profit beyond that. Only
+        meaningful once `peak_roi_pct >= trailing_arm_pct` — callers must
+        check that themselves, same as the rest of this class's threshold
+        checks."""
+        steps = math.floor((peak_roi_pct - self._trailing_arm_pct) / self._trailing_step_increment_pct)
+        return self._trailing_base_pct + steps * self._trailing_step_pct
 
     async def _arm_native_stop(self, detail: PositionDetail) -> None:
         order_id = await self._broker.place_stop_loss(
